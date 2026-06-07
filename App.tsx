@@ -340,6 +340,39 @@ function memToBinary(bytes: number[]): string {
   return bytes.map(b => b.toString(2).padStart(8, '0')).join(' ');
 }
 
+// Parse NDEF TLV stream from NFC Forum Type 2 Tag user pages (pages 4+).
+// Returns the raw NDEF message bytes and decoded records.
+function extractNdefFromPages(pages: { page: number; hex: string }[]): {
+  ndefBytes: number[];
+  records: ParsedRecord[];
+} {
+  const userBytes: number[] = [];
+  for (const p of pages) {
+    if (p.page < 4) continue;
+    p.hex.trim().split(/\s+/).forEach(h => userBytes.push(parseInt(h, 16)));
+  }
+  let i = 0;
+  while (i < userBytes.length) {
+    const tag = userBytes[i++];
+    if (tag === 0xFE || tag === undefined) break;
+    if (tag === 0x00) continue;
+    let len = userBytes[i++];
+    if (len === 0xFF && i + 1 < userBytes.length) {
+      len = (userBytes[i] << 8) | userBytes[i + 1];
+      i += 2;
+    }
+    if (tag === 0x03 && len > 0) {
+      const ndefBytes = userBytes.slice(i, i + len);
+      try {
+        const rawRecords: any[] = Ndef.decodeMessage(ndefBytes);
+        return { ndefBytes, records: rawRecords.map(parseRecord) };
+      } catch { break; }
+    }
+    i += len;
+  }
+  return { ndefBytes: [], records: [] };
+}
+
 // ── Memory Manager ────────────────────────────────────────────────────────────
 
 const MEMORY_TABS: { id: MemoryTab; label: string }[] = [
@@ -475,11 +508,10 @@ function MemoryManager({
   const [exportFormat, setExportFormat] = useState<ExportFormat>('hex');
   const [actionOpen, setActionOpen] = useState(false);
   const [formatOpen, setFormatOpen] = useState(false);
-  // For non-NDEF tags, show the raw page dump instead of the (empty) NDEF bytes.
-  const bytes = tagData.rawNdefBytes.length > 0
-    ? tagData.rawNdefBytes
-    : (tagData.rawPages ?? []).flatMap(p =>
-        p.hex.trim().split(/\s+/).map(h => parseInt(h, 16)));
+  // Prefer the full raw page dump (complete memory) when available; fall back to NDEF bytes.
+  const bytes = tagData.rawPages && tagData.rawPages.length > 0
+    ? tagData.rawPages.flatMap(p => p.hex.trim().split(/\s+/).map(h => parseInt(h, 16)))
+    : tagData.rawNdefBytes;
 
   async function handleExport() {
     if (exportFormat === 'onfct') {
@@ -633,42 +665,33 @@ function ReadScreen() {
     setTagData(null);
     setErrorMsg('');
 
+    const records: ParsedRecord[] = [];
+    let rawNdefBytes: number[] = [];
+    let rawPages: { page: number; hex: string }[] | undefined;
+    let raw: any = null;
+
     try {
-      let usedNdef = true;
+      // Phase 1: NDEF tech — get parsed records and tag metadata.
+      // We cancel after reading so Phase 2 can connect via NfcA on the same tap.
       try {
         await NfcManager.requestTechnology(NfcTech.Ndef);
-      } catch {
-        usedNdef = false;
-        await NfcManager.requestTechnology(NfcTech.NfcA);
-      }
-
-      const raw = (await NfcManager.getTag()) as any;
-      if (!raw) throw new Error('No tag detected');
-
-      const records: ParsedRecord[] = [];
-      let rawNdefBytes: number[] = [];
-
-      if (usedNdef && Array.isArray(raw.ndefMessage) && raw.ndefMessage.length > 0) {
-        for (const r of raw.ndefMessage) {
-          records.push(parseRecord(r));
+        raw = (await NfcManager.getTag()) as any;
+        if (raw && Array.isArray(raw.ndefMessage) && raw.ndefMessage.length > 0) {
+          for (const r of raw.ndefMessage) records.push(parseRecord(r));
+          rawNdefBytes = encodeNdefFallback(raw.ndefMessage);
         }
-        // Encode the full NDEF message — headers + type + id + payload — so the
-        // bytes we store are identical to what's on the tag regardless of whether
-        // we can semantically parse the record type.
-        // Android delivers `type` as number[] but the library's encodeMessage
-        // expects a string — use our own encoder which handles byte arrays directly.
-        rawNdefBytes = encodeNdefFallback(raw.ndefMessage);
-      }
+        await NfcManager.cancelTechnologyRequest();
+      } catch { /* NDEF not available, or tag removed before Phase 2 — handled below */ }
 
-      // For non-NDEF NfcA tags, read raw memory pages using the ISO 14443-3A
-      // READ command (0x30). Each call returns 4 pages (16 bytes); we stop when
-      // the tag NAKs (page address out of range).
-      let rawPages: { page: number; hex: string }[] | undefined;
-      if (!usedNdef) {
+      // Phase 2: MifareUltralight tech — dump all raw pages for a complete memory snapshot.
+      // Works for Ultralight/NTAG; quietly skipped for IsoDep (Type 4) tags.
+      try {
+        await NfcManager.requestTechnology(NfcTech.MifareUltralight);
+        if (!raw) raw = (await NfcManager.getTag()) as any;
         const pages: { page: number; hex: string }[] = [];
         for (let pageNum = 0; pageNum < 256; pageNum += 4) {
           try {
-            const resp: number[] = await NfcManager.nfcAHandler.transceive([0x30, pageNum]);
+            const resp: number[] = await NfcManager.mifareUltralightHandlerAndroid.readPages(pageNum);
             for (let i = 0; i < 4 && pageNum + i < 256; i++) {
               const slice = resp.slice(i * 4, (i + 1) * 4);
               pages.push({
@@ -676,12 +699,20 @@ function ReadScreen() {
                 hex: slice.map((b: number) => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
               });
             }
-          } catch {
-            break;
+          } catch { break; }
+        }
+        if (pages.length > 0) {
+          rawPages = pages;
+          // If NDEF phase didn't yield records (unformatted tag), parse from raw pages
+          if (records.length === 0) {
+            const parsed = extractNdefFromPages(pages);
+            rawNdefBytes = parsed.ndefBytes;
+            parsed.records.forEach(r => records.push(r));
           }
         }
-        if (pages.length > 0) rawPages = pages;
-      }
+      } catch { /* IsoDep or MifareUltralight unsupported — fine if Phase 1 gave us NDEF data */ }
+
+      if (!raw) throw new Error('No tag detected');
 
       const techTypes = ((raw.techTypes ?? []) as string[]).map(shortTech);
       const tagMeta = identifyTag(techTypes, raw.sak, raw.atqa, raw.maxSize);
@@ -943,15 +974,16 @@ function WriteScreen() {
       setErrorMsg('');
       try {
         if (onfctFile.raw?.pages && onfctFile.raw.pages.length > 0) {
-          // Non-NDEF tag: write raw pages back via NfcA transceive.
-          // Pages 0-3 hold UID, internal bytes, lock bits and OTP — all read-only
-          // on the target tag, so we skip them and only restore user memory.
-          await NfcManager.requestTechnology(NfcTech.NfcA);
+          // Write raw pages back via MifareUltralight writePage.
+          // Pages 0-2: UID, OTP, lock bytes — hardware read-only, skip them.
+          // Page 3: CC (Capability Container) — writable; restoring it makes a
+          // blank target NDEF-capable with the correct size/permissions.
+          // Pages 4+: user data (NDEF TLV).
+          await NfcManager.requestTechnology(NfcTech.MifareUltralight);
           for (const { page, hex } of onfctFile.raw.pages) {
-            if (page < 4) continue;
+            if (page < 3) continue;
             const data = hex.trim().split(/\s+/).map(h => parseInt(h, 16));
-            // Mifare Ultralight WRITE command: 0xA2 [page] [4 bytes]
-            await NfcManager.nfcAHandler.transceive([0xA2, page, ...data]);
+            await NfcManager.mifareUltralightHandlerAndroid.writePage(page, data);
           }
         } else {
           const bytes = onfctFile.ndef.encodedHex
@@ -1121,7 +1153,7 @@ function WriteScreen() {
 
 // ── Other screen ─────────────────────────────────────────────────────────────
 
-type OtherSubScreen = null | 'erase' | 'emulate' | 'format';
+type OtherSubScreen = null | 'erase' | 'emulate' | 'format' | 'clone';
 
 function BackButton({ onPress }: { onPress: () => void }) {
   return (
@@ -1442,17 +1474,189 @@ function EmulateFlow({ onBack }: { onBack: () => void }) {
   );
 }
 
+type CloneStatus = 'idle' | 'reading' | 'ready' | 'writing' | 'done' | 'error';
+
+function CloneFlow({ onBack }: { onBack: () => void }) {
+  const [status, setStatus] = useState<CloneStatus>('idle');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [sourceBytes, setSourceBytes] = useState<number[]>([]);
+  const [sourceRecordCount, setSourceRecordCount] = useState(0);
+
+  async function readSource() {
+    setStatus('reading');
+    setErrorMsg('');
+    try {
+      await NfcManager.requestTechnology(NfcTech.Ndef);
+      const tag = (await NfcManager.getTag()) as any;
+      if (!tag) throw new Error('No tag detected');
+      const msg = tag.ndefMessage;
+      if (!Array.isArray(msg) || msg.length === 0) throw new Error('Source tag has no NDEF data to clone');
+      const bytes = encodeNdefFallback(msg);
+      setSourceBytes(bytes);
+      setSourceRecordCount(msg.length);
+      Vibration.vibrate(100);
+      setStatus('ready');
+    } catch (e: any) {
+      const msg: string = e?.message ?? String(e);
+      if (msg === 'cancelled') { setStatus('idle'); }
+      else { setErrorMsg(msg); setStatus('error'); }
+    } finally {
+      NfcManager.cancelTechnologyRequest().catch(() => {});
+    }
+  }
+
+  async function writeTarget() {
+    setStatus('writing');
+    setErrorMsg('');
+    try {
+      let usedNdef = true;
+      try {
+        await NfcManager.requestTechnology(NfcTech.Ndef);
+      } catch {
+        usedNdef = false;
+        await NfcManager.requestTechnology(NfcTech.NdefFormatable);
+      }
+
+      if (usedNdef) {
+        const tag = (await NfcManager.getTag()) as any;
+        if (tag?.maxSize != null && tag.maxSize < sourceBytes.length) {
+          throw new Error(`Target tag is too small: ${tag.maxSize} bytes available, source needs ${sourceBytes.length}.`);
+        }
+        await NfcManager.ndefHandler.writeNdefMessage(sourceBytes);
+      } else {
+        await NfcManager.ndefFormatableHandlerAndroid.formatNdef(sourceBytes);
+      }
+
+      Vibration.vibrate(200);
+      setStatus('done');
+    } catch (e: any) {
+      const msg: string = e?.message ?? String(e);
+      if (msg === 'cancelled') { setStatus('ready'); }
+      else { setErrorMsg(msg); setStatus('error'); }
+    } finally {
+      NfcManager.cancelTechnologyRequest().catch(() => {});
+    }
+  }
+
+  function cancelRead() {
+    NfcManager.cancelTechnologyRequest().catch(() => {});
+    setStatus('idle');
+  }
+
+  function cancelWrite() {
+    NfcManager.cancelTechnologyRequest().catch(() => {});
+    setStatus('ready');
+  }
+
+  if (status === 'reading') {
+    return (
+      <View style={styles.screen}>
+        <View style={[styles.iconCircle, styles.iconCircleScanning]}>
+          <Text style={styles.iconText}>⟳</Text>
+        </View>
+        <Text style={styles.screenTitle}>Scan Source Tag</Text>
+        <Text style={styles.screenSubtitle}>Hold the tag you want to clone near your phone</Text>
+        <TouchableOpacity style={[styles.actionButton, styles.actionButtonCancel]} onPress={cancelRead}>
+          <Text style={styles.actionButtonText}>Cancel</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (status === 'ready') {
+    return (
+      <View style={styles.screen}>
+        <View style={[styles.iconCircle, styles.iconCircleWrite]}>
+          <Text style={styles.iconText}>✓</Text>
+        </View>
+        <Text style={styles.screenTitle}>Source Read</Text>
+        <View style={[styles.card, { alignSelf: 'stretch', marginBottom: 4 }]}>
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>NDEF records</Text>
+            <Text style={styles.infoValue}>{sourceRecordCount}</Text>
+          </View>
+          <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
+            <Text style={styles.infoLabel}>Bytes in RAM</Text>
+            <Text style={styles.infoValue}>{sourceBytes.length}</Text>
+          </View>
+        </View>
+        <TouchableOpacity style={[styles.actionButton, styles.actionButtonWrite, { alignSelf: 'stretch' }]} onPress={writeTarget} activeOpacity={0.7}>
+          <Text style={styles.actionButtonText}>Write to Target Tag</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.actionButton, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, alignSelf: 'stretch' }]} onPress={() => { setSourceBytes([]); setStatus('idle'); }} activeOpacity={0.7}>
+          <Text style={[styles.actionButtonText, { color: C.text }]}>Re-scan Source</Text>
+        </TouchableOpacity>
+        <BackButton onPress={onBack} />
+      </View>
+    );
+  }
+
+  if (status === 'writing') {
+    return (
+      <View style={styles.screen}>
+        <View style={[styles.iconCircle, styles.iconCircleScanning]}>
+          <Text style={styles.iconText}>⟳</Text>
+        </View>
+        <Text style={styles.screenTitle}>Scan Target Tag</Text>
+        <Text style={styles.screenSubtitle}>Hold the target tag near your phone — keep it still</Text>
+        <TouchableOpacity style={[styles.actionButton, styles.actionButtonCancel]} onPress={cancelWrite}>
+          <Text style={styles.actionButtonText}>Cancel</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (status === 'done') {
+    return (
+      <View style={styles.screen}>
+        <View style={[styles.iconCircle, styles.iconCircleWrite]}>
+          <Text style={styles.iconText}>✓</Text>
+        </View>
+        <Text style={styles.screenTitle}>Clone Complete</Text>
+        <Text style={styles.screenSubtitle}>NDEF data written to target tag.</Text>
+        <TouchableOpacity style={[styles.actionButton, styles.actionButtonOther]} onPress={() => { setSourceBytes([]); setStatus('idle'); }}>
+          <Text style={styles.actionButtonText}>Clone Another</Text>
+        </TouchableOpacity>
+        <BackButton onPress={onBack} />
+      </View>
+    );
+  }
+
+  // idle + error
+  return (
+    <View style={styles.screen}>
+      <View style={[styles.iconCircle, status === 'error' ? styles.iconCircleError : styles.iconCircleOther]}>
+        <Text style={styles.iconText}>⊕</Text>
+      </View>
+      <Text style={styles.screenTitle}>Clone Tag</Text>
+      {status === 'error' ? (
+        <Text style={[styles.screenSubtitle, styles.errorText]}>{errorMsg}</Text>
+      ) : (
+        <Text style={styles.screenSubtitle}>
+          Reads the NDEF data from a source tag into memory, then writes the exact same bytes to a target tag.
+        </Text>
+      )}
+      <TouchableOpacity style={[styles.actionButton, styles.actionButtonOther]} onPress={readSource}>
+        <Text style={styles.actionButtonText}>{status === 'error' ? 'Try Again' : 'Start — Scan Source Tag'}</Text>
+      </TouchableOpacity>
+      <BackButton onPress={onBack} />
+    </View>
+  );
+}
+
 function OtherScreen() {
   const [subScreen, setSubScreen] = useState<OtherSubScreen>(null);
 
   if (subScreen === 'erase')   return <EraseFlow   onBack={() => setSubScreen(null)} />;
   if (subScreen === 'emulate') return <EmulateFlow onBack={() => setSubScreen(null)} />;
   if (subScreen === 'format')  return <FormatFlow  onBack={() => setSubScreen(null)} />;
+  if (subScreen === 'clone')   return <CloneFlow   onBack={() => setSubScreen(null)} />;
 
   const OPTIONS: { key: OtherSubScreen & string; title: string; desc: string; icon: string }[] = [
     { key: 'erase',   title: 'Erase Tag',    desc: 'Clear all NDEF data from a tag',              icon: '⌫' },
     { key: 'format',  title: 'Format Tag',   desc: 'Initialise an unformatted tag for NDEF use',  icon: '⊞' },
     { key: 'emulate', title: 'Emulate Tag',  desc: 'Emulate a tag from a hex memory dump',        icon: '◈' },
+    { key: 'clone',   title: 'Clone Tag',    desc: 'Copy all memory pages from one tag to another', icon: '⊕' },
   ];
 
   return (
