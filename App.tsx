@@ -247,7 +247,7 @@ function shortTech(full: string): string {
 function parseRecord(r: { tnf: number; type: number[]; payload: number[]; id: number[] }): ParsedRecord {
   const typeStr = r.type.map(b => String.fromCharCode(b)).join('');
   const raw = toHex(r.payload);
-  const base = { tnf: r.tnf, typeStr, typeBytes: r.type, idBytes: r.id ?? [], raw };
+  const base = { tnf: r.tnf, typeStr, typeBytes: Array.isArray(r.type) ? r.type : [], idBytes: Array.isArray(r.id) ? r.id : [], raw };
 
   if (r.tnf === Ndef.TNF_WELL_KNOWN) {
     if (typeStr === 'T') {
@@ -381,8 +381,6 @@ type OnfctFile = {
 };
 
 function buildOnfct(tagData: TagData): string {
-  // rawNdefBytes holds the exact bytes returned by Ndef.encodeMessage at scan time —
-  // use them directly so the file round-trips without any re-encoding loss.
   const encodedHex = tagData.rawNdefBytes
     .map(b => b.toString(16).padStart(2, '0').toUpperCase())
     .join(' ');
@@ -401,13 +399,12 @@ function buildOnfct(tagData: TagData): string {
       techTypes: tagData.techTypes,
     },
     ndef: {
-      encodedHex,   // full NDEF message — primary source for emulation
+      encodedHex,
       recordCount: tagData.records.length,
       records: tagData.records.map(r => ({
         label: r.label,
         value: r.value,
         tnf: r.tnf,
-        // store raw bytes (not just ASCII typeStr) so reconstruction is lossless
         typeHex:    r.typeBytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
         idHex:      r.idBytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
         payloadHex: r.raw.split(':').filter(Boolean).join(' '),
