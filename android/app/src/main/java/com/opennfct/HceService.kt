@@ -19,7 +19,7 @@ class HceService : HostApduService() {
         private val NO_APP_FOUND   = byteArrayOf(0x6A.toByte(), 0x82.toByte())
         private val FILE_NOT_FOUND = byteArrayOf(0x6A.toByte(), 0x82.toByte())
         private val WRONG_PARAMS   = byteArrayOf(0x6B.toByte(), 0x00)
-        private val UNKNOWN_CMD    = byteArrayOf(0x00, 0x00)
+        private val UNKNOWN_CMD    = byteArrayOf(0x6D.toByte(), 0x00)
 
         @Volatile var ndefContent: ByteArray = byteArrayOf()
     }

@@ -1169,6 +1169,8 @@ function EmulateFlow({ onBack }: { onBack: () => void }) {
     }
   }
 
+  const isMifareClassic = onfct?.tag.dataFormat === 'NXP Mifare Classic';
+
   async function startEmulation() {
     if (!onfct) return;
     setErrorMsg('');
@@ -1201,6 +1203,17 @@ function EmulateFlow({ onBack }: { onBack: () => void }) {
             <Text style={styles.infoValue}>{onfct.ndef.encodedHex.split(' ').filter(Boolean).length}</Text>
           </View>
         </View>
+        {isMifareClassic && (
+          <View style={styles.emulateWarning}>
+            <Text style={styles.emulateWarningTitle}>Mifare Classic limitation</Text>
+            <Text style={styles.emulateWarningBody}>
+              Android HCE can only emulate ISO-DEP (Type 4) cards. The phone will be detected as a
+              Type 4 tag, not Mifare Classic. Readers that exclusively accept Mifare Classic (e.g.
+              most access-control systems) will reject it. Readers that also support ISO-DEP will
+              be able to read the NDEF content.
+            </Text>
+          </View>
+        )}
         <Text style={[styles.screenSubtitle, { marginTop: 16, marginLeft: 2 }]}>
           Hold your phone near an NFC reader to be detected as a Type 4 Tag.
         </Text>
@@ -1264,6 +1277,17 @@ function EmulateFlow({ onBack }: { onBack: () => void }) {
       {errorMsg ? (
         <Text style={[styles.screenSubtitle, styles.errorText, { marginTop: 10, marginLeft: 2 }]}>{errorMsg}</Text>
       ) : null}
+
+      {onfct && isMifareClassic && (
+        <View style={[styles.emulateWarning, { marginTop: 16 }]}>
+          <Text style={styles.emulateWarningTitle}>Mifare Classic limitation</Text>
+          <Text style={styles.emulateWarningBody}>
+            Android HCE can only emulate ISO-DEP (Type 4) cards. Readers that exclusively
+            accept Mifare Classic will reject the phone. Readers that support ISO-DEP will
+            still be able to read the NDEF content.
+          </Text>
+        </View>
+      )}
 
       {onfct && (
         <TouchableOpacity
@@ -1586,6 +1610,15 @@ const styles = StyleSheet.create({
 
   // Info value inside infoValueCol (no nested maxWidth constraint)
   infoValueFull: { fontSize: 13, color: C.text, textAlign: 'right', flexShrink: 1 },
+
+  // Emulate — Mifare Classic limitation warning
+  emulateWarning: {
+    backgroundColor: '#3a2a00', borderRadius: 8,
+    borderWidth: 1, borderColor: '#7a5a00',
+    padding: 14, marginTop: 8,
+  },
+  emulateWarningTitle: { fontSize: 13, fontWeight: '700', color: C.warning, marginBottom: 6 },
+  emulateWarningBody: { fontSize: 12, color: '#ccaa55', lineHeight: 18 },
 });
 
 export default App;

@@ -383,7 +383,11 @@ void loop() {
 
   MFRC522::PICC_Type t = rfid.PICC_GetType(rfid.uid.sak);
 
-  if (t == MFRC522::PICC_TYPE_ISO_14443_4) {
+  // Check the ISO-DEP bit (bit 5 = 0x20) directly in SAK.
+  // Some MFRC522 library versions misclassify SAK=0x28 (common on Samsung/NXP phones
+  // in HCE mode) as PICC_TYPE_MIFARE_1K, causing Mifare auth to be attempted instead
+  // of ISO-DEP. Checking the bit directly covers SAK=0x20 and SAK=0x28.
+  if (rfid.uid.sak & 0x20) {
     readT4TCard(); // Android HCE or any Type 4 Tag — read-only
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
