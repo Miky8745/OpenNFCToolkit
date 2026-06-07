@@ -71,6 +71,7 @@ type TagData = {
   tagMeta: TagMeta | null;
   rawNdefBytes: number[];
   ndefUsedBytes: number;
+  rawPages?: { page: number; hex: string }[];
 };
 
 // ── Colors ───────────────────────────────────────────────────────────────────
@@ -378,6 +379,7 @@ type OnfctFile = {
     techTypes?: string[];
   };
   ndef: { encodedHex: string; recordCount: number; records: { label: string; value: string }[] };
+  raw?: { pages: { page: number; hex: string }[] };
 };
 
 function buildOnfct(tagData: TagData): string {
@@ -410,6 +412,9 @@ function buildOnfct(tagData: TagData): string {
         payloadHex: r.raw.split(':').filter(Boolean).join(' '),
       })),
     },
+    ...(tagData.rawPages && tagData.rawPages.length > 0
+      ? { raw: { pages: tagData.rawPages } }
+      : {}),
   }, null, 2);
 }
 
@@ -470,7 +475,11 @@ function MemoryManager({
   const [exportFormat, setExportFormat] = useState<ExportFormat>('hex');
   const [actionOpen, setActionOpen] = useState(false);
   const [formatOpen, setFormatOpen] = useState(false);
-  const bytes = tagData.rawNdefBytes;
+  // For non-NDEF tags, show the raw page dump instead of the (empty) NDEF bytes.
+  const bytes = tagData.rawNdefBytes.length > 0
+    ? tagData.rawNdefBytes
+    : (tagData.rawPages ?? []).flatMap(p =>
+        p.hex.trim().split(/\s+/).map(h => parseInt(h, 16)));
 
   async function handleExport() {
     if (exportFormat === 'onfct') {
@@ -651,6 +660,29 @@ function ReadScreen() {
         rawNdefBytes = encodeNdefFallback(raw.ndefMessage);
       }
 
+      // For non-NDEF NfcA tags, read raw memory pages using the ISO 14443-3A
+      // READ command (0x30). Each call returns 4 pages (16 bytes); we stop when
+      // the tag NAKs (page address out of range).
+      let rawPages: { page: number; hex: string }[] | undefined;
+      if (!usedNdef) {
+        const pages: { page: number; hex: string }[] = [];
+        for (let pageNum = 0; pageNum < 256; pageNum += 4) {
+          try {
+            const resp: number[] = await NfcManager.nfcAHandler.transceive([0x30, pageNum]);
+            for (let i = 0; i < 4 && pageNum + i < 256; i++) {
+              const slice = resp.slice(i * 4, (i + 1) * 4);
+              pages.push({
+                page: pageNum + i,
+                hex: slice.map((b: number) => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
+              });
+            }
+          } catch {
+            break;
+          }
+        }
+        if (pages.length > 0) rawPages = pages;
+      }
+
       const techTypes = ((raw.techTypes ?? []) as string[]).map(shortTech);
       const tagMeta = identifyTag(techTypes, raw.sak, raw.atqa, raw.maxSize);
 
@@ -666,6 +698,7 @@ function ReadScreen() {
         tagMeta,
         rawNdefBytes,
         ndefUsedBytes: rawNdefBytes.length,
+        rawPages,
       });
       Vibration.vibrate(200);
       setStatus('done');
@@ -831,7 +864,7 @@ function InfoRow({ label, value, mono }: { label: string; value: string; mono?: 
 
 // ── Write screen ─────────────────────────────────────────────────────────────
 
-type WriteRecordType = 'text' | 'url' | 'email' | 'phone';
+type WriteRecordType = 'text' | 'url' | 'email' | 'phone' | 'onfct';
 type WriteStatus = 'idle' | 'writing' | 'done' | 'error';
 
 const WRITE_TYPE_OPTIONS: { label: string; value: WriteRecordType }[] = [
@@ -839,6 +872,7 @@ const WRITE_TYPE_OPTIONS: { label: string; value: WriteRecordType }[] = [
   { label: 'URL', value: 'url' },
   { label: 'Email', value: 'email' },
   { label: 'Phone', value: 'phone' },
+  { label: '.onfct File', value: 'onfct' },
 ];
 
 function writePlaceholder(t: WriteRecordType) {
@@ -866,21 +900,88 @@ function buildRecord(type: WriteRecordType, text: string) {
 function WriteScreen() {
   const [recordType, setRecordType] = useState<WriteRecordType>('text');
   const [content, setContent] = useState('');
+  const [onfctFile, setOnfctFile] = useState<OnfctFile | null>(null);
+  const [onfctError, setOnfctError] = useState('');
   const [status, setStatus] = useState<WriteStatus>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [typeOpen, setTypeOpen] = useState(false);
 
+  async function loadOnfctFile() {
+    setOnfctError('');
+    try {
+      const content: string = await openFileAsync('*/*');
+      const parsed = JSON.parse(content) as OnfctFile;
+      if (parsed.format !== 'onfct') throw new Error('Not a valid .onfct file');
+      if (!parsed.ndef?.encodedHex) throw new Error('File contains no NDEF data');
+      setOnfctFile(parsed);
+    } catch (e: any) {
+      if (e?.code !== 'CANCELLED') {
+        setOnfctError(e?.message ?? 'Invalid file format');
+      }
+    }
+  }
+
+  async function writeBytes(bytes: number[]) {
+    let usedNdef = true;
+    try {
+      await NfcManager.requestTechnology(NfcTech.Ndef);
+    } catch {
+      usedNdef = false;
+      await NfcManager.requestTechnology(NfcTech.NdefFormatable);
+    }
+    if (usedNdef) {
+      await NfcManager.ndefHandler.writeNdefMessage(bytes);
+    } else {
+      await NfcManager.ndefFormatableHandlerAndroid.formatNdef(bytes);
+    }
+  }
+
   async function write() {
+    if (recordType === 'onfct') {
+      if (!onfctFile) return;
+      setStatus('writing');
+      setErrorMsg('');
+      try {
+        if (onfctFile.raw?.pages && onfctFile.raw.pages.length > 0) {
+          // Non-NDEF tag: write raw pages back via NfcA transceive.
+          // Pages 0-3 hold UID, internal bytes, lock bits and OTP — all read-only
+          // on the target tag, so we skip them and only restore user memory.
+          await NfcManager.requestTechnology(NfcTech.NfcA);
+          for (const { page, hex } of onfctFile.raw.pages) {
+            if (page < 4) continue;
+            const data = hex.trim().split(/\s+/).map(h => parseInt(h, 16));
+            // Mifare Ultralight WRITE command: 0xA2 [page] [4 bytes]
+            await NfcManager.nfcAHandler.transceive([0xA2, page, ...data]);
+          }
+        } else {
+          const bytes = onfctFile.ndef.encodedHex
+            .trim()
+            .split(/[\s,:\n]+/)
+            .filter(Boolean)
+            .map(h => parseInt(h, 16));
+          await writeBytes(bytes);
+        }
+        Vibration.vibrate(200);
+        setStatus('done');
+      } catch (e: any) {
+        const msg: string = e?.message ?? String(e);
+        if (msg === 'cancelled') { setStatus('idle'); }
+        else { setErrorMsg(msg); setStatus('error'); }
+      } finally {
+        NfcManager.cancelTechnologyRequest().catch(() => {});
+      }
+      return;
+    }
+
     const trimmed = content.trim();
     if (!trimmed) return;
     setStatus('writing');
     setErrorMsg('');
     try {
-      await NfcManager.requestTechnology(NfcTech.Ndef);
       const record = buildRecord(recordType, trimmed);
       const bytes = Ndef.encodeMessage([record]);
       if (!bytes) throw new Error('Failed to encode NDEF message');
-      await NfcManager.ndefHandler.writeNdefMessage(bytes);
+      await writeBytes(bytes);
       Vibration.vibrate(200);
       setStatus('done');
     } catch (e: any) {
@@ -896,6 +997,8 @@ function WriteScreen() {
     NfcManager.cancelTechnologyRequest().catch(() => {});
     setStatus('idle');
   }
+
+  const canWrite = recordType === 'onfct' ? onfctFile !== null : content.trim().length > 0;
 
   if (status === 'writing') {
     return (
@@ -922,7 +1025,7 @@ function WriteScreen() {
         <Text style={styles.screenSubtitle}>The tag has been written.</Text>
         <TouchableOpacity
           style={[styles.actionButton, styles.actionButtonWrite]}
-          onPress={() => { setStatus('idle'); setContent(''); }}>
+          onPress={() => { setStatus('idle'); setContent(''); setOnfctFile(null); }}>
           <Text style={styles.actionButtonText}>Write Another</Text>
         </TouchableOpacity>
       </View>
@@ -941,26 +1044,61 @@ function WriteScreen() {
         <Dropdown
           options={WRITE_TYPE_OPTIONS}
           value={recordType}
-          onSelect={v => { setRecordType(v); setContent(''); }}
+          onSelect={v => { setRecordType(v); setContent(''); setOnfctFile(null); setOnfctError(''); }}
           isOpen={typeOpen}
           onToggle={() => setTypeOpen(v => !v)}
         />
       </View>
 
       <SectionLabel text="Content" />
-      <View style={styles.card}>
-        <TextInput
-          style={[styles.writeInput, recordType === 'text' && styles.writeInputMulti]}
-          value={content}
-          onChangeText={setContent}
-          placeholder={writePlaceholder(recordType)}
-          placeholderTextColor={C.textMuted}
-          keyboardType={writeKeyboard(recordType)}
-          multiline={recordType === 'text'}
-          autoCapitalize={recordType === 'text' ? 'sentences' : 'none'}
-          autoCorrect={recordType === 'text'}
-        />
-      </View>
+      {recordType === 'onfct' ? (
+        <>
+          {onfctFile ? (
+            <View style={styles.card}>
+              <InfoRow label="Type" value={onfctFile.tag.type} />
+              <InfoRow label="UID" value={onfctFile.tag.uid} mono />
+              <InfoRow label="Records" value={String(onfctFile.ndef.recordCount)} />
+              <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.infoLabel}>NDEF Bytes</Text>
+                <Text style={styles.infoValue}>
+                  {onfctFile.ndef.encodedHex.trim().split(/[\s,:\n]+/).filter(Boolean).length}
+                </Text>
+              </View>
+            </View>
+          ) : (
+            <View style={styles.card}>
+              <Text style={[styles.writeInput, { color: C.textMuted, paddingVertical: 14 }]}>
+                No file loaded — tap below to pick a .onfct file
+              </Text>
+            </View>
+          )}
+          <TouchableOpacity
+            style={[styles.actionButton, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, alignSelf: 'stretch', marginTop: 10 }]}
+            onPress={loadOnfctFile}
+            activeOpacity={0.7}>
+            <Text style={[styles.actionButtonText, { color: C.text }]}>
+              {onfctFile ? 'Load Different File' : 'Load .onfct File'}
+            </Text>
+          </TouchableOpacity>
+          {onfctError ? (
+            <Text style={[styles.screenSubtitle, styles.errorText, styles.writeError]}>{onfctError}</Text>
+          ) : null}
+        </>
+      ) : (
+        <View style={styles.card}>
+          <TextInput
+            style={[styles.writeInput, recordType === 'text' && styles.writeInputMulti]}
+            value={content}
+            onChangeText={setContent}
+            placeholder={writePlaceholder(recordType)}
+            placeholderTextColor={C.textMuted}
+            keyboardType={writeKeyboard(recordType)}
+            multiline={recordType === 'text'}
+            autoCapitalize={recordType === 'text' ? 'sentences' : 'none'}
+            autoCorrect={recordType === 'text'}
+          />
+        </View>
+      )}
 
       {status === 'error' && (
         <Text style={[styles.screenSubtitle, styles.errorText, styles.writeError]}>{errorMsg}</Text>
@@ -968,10 +1106,10 @@ function WriteScreen() {
 
       <TouchableOpacity
         style={[styles.actionButton, styles.actionButtonWrite, styles.writeSubmitBtn,
-                !content.trim() && styles.writeSubmitBtnDisabled]}
+                !canWrite && styles.writeSubmitBtnDisabled]}
         onPress={write}
         activeOpacity={0.7}
-        disabled={!content.trim()}>
+        disabled={!canWrite}>
         <Text style={styles.actionButtonText}>
           {status === 'error' ? 'Try Again' : 'Write to Tag'}
         </Text>

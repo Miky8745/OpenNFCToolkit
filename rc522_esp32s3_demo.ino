@@ -1,13 +1,9 @@
 /**
- * RC522 NDEF-compatible read/write for ESP32-S3
+ * RC522 NDEF-compatible reader for ESP32-S3
  *
- * Compatible with NFC Tools (Android/iOS) and any NFC Forum app.
- * Reads/writes NDEF Text Records on sector 1, blocks 4/5/6.
- * Tries NFC Forum key D3:F7:D3:F7:D3:F7 first, then 0xFF fallback.
- *
- * Usage:
- *   Type text + Enter in Serial Monitor -> writes on next card tap
- *   Tap card with nothing typed         -> reads and prints text
+ * Compatible with NFC Tools (Android/iOS), OpenNFCT, and any NFC Forum app.
+ * Reads NDEF Text/URI Records from Mifare Classic (sector 1, blocks 4/5/6)
+ * and from ISO-DEP Type 4 Tags (including Android HCE).
  *
  * Wiring:
  *  RC522 SDA  --> GPIO 10
@@ -38,8 +34,36 @@ static const byte KEYS[][6] = {
   {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
 };
 
-String pendingWrite = "";
-bool writeQueued    = false;
+// -------------------------------------------------------
+// Write state — set by Serial command, consumed on next card tap
+// -------------------------------------------------------
+static bool hasPendingWrite = false;
+static byte writeData[48];   // pre-built NDEF TLV ready to go to the card
+static byte writeDataLen = 0;
+
+// Build a Mifare-NDEF TLV Text record into buf[48].
+// Layout: 03 <recordLen> D1 01 <payloadLen> 54 02 "en" <text> FE 00...
+// Returns number of meaningful bytes (rest of buf is already zeroed).
+byte buildNDEFText(const String& text, byte* buf) {
+  byte textLen    = (byte)min((int)text.length(), 38); // 48 - 10 header bytes
+  byte payloadLen = 3 + textLen;                        // status(1) + "en"(2) + text
+  byte recordLen  = 4 + payloadLen;                     // hdr+type_len+payload_len+type + payload
+  memset(buf, 0, 48);
+  byte i = 0;
+  buf[i++] = 0x03;        // NDEF TLV tag
+  buf[i++] = recordLen;   // NDEF message length
+  buf[i++] = 0xD1;        // MB=1 ME=1 SR=1 TNF=01 (Well-known)
+  buf[i++] = 0x01;        // type length = 1
+  buf[i++] = payloadLen;  // payload length
+  buf[i++] = 0x54;        // type 'T' (Text)
+  buf[i++] = 0x02;        // status: UTF-8, lang len = 2
+  buf[i++] = 'e';
+  buf[i++] = 'n';
+  memcpy(buf + i, text.c_str(), textLen);
+  i += textLen;
+  buf[i++] = 0xFE;        // Terminator TLV
+  return i;
+}
 
 // -------------------------------------------------------
 // ISO-DEP (Type 4 Tag) support — for Android HCE
@@ -194,35 +218,6 @@ bool authSector1() {
 }
 
 // -------------------------------------------------------
-// NDEF builder — wraps text in a short NDEF Text Record TLV
-//
-// Wire format (example "hi"):
-//   03 0A D1 01 06 54 02 65 6E 68 69 FE 00 00 ...
-//   ^^ ^^                                  ^^
-//   |  NDEF record len                     Terminator TLV
-//   NDEF TLV tag
-// -------------------------------------------------------
-void buildNDEF(const String& text, byte* buf /*48 bytes*/) {
-  memset(buf, 0, 48);
-  byte tlen        = min((unsigned int)text.length(), (unsigned int)38);
-  byte payload_len = 1 + 2 + tlen;   // status + "en" + text
-  byte record_len  = 1 + 1 + 1 + 1 + payload_len; // header+typelen+payloadlen+type+payload
-
-  byte p = 0;
-  buf[p++] = 0x03;         // NDEF TLV tag
-  buf[p++] = record_len;   // NDEF record length
-  buf[p++] = 0xD1;         // MB | ME | SR | TNF=Well-known
-  buf[p++] = 0x01;         // type length = 1
-  buf[p++] = payload_len;  // payload length
-  buf[p++] = 0x54;         // type 'T'  (Text record)
-  buf[p++] = 0x02;         // status: UTF-8, language code length = 2
-  buf[p++] = 0x65;         // 'e'
-  buf[p++] = 0x6E;         // 'n'
-  for (byte i = 0; i < tlen; i++) buf[p++] = (byte)text[i];
-  buf[p++] = 0xFE;         // Terminator TLV
-}
-
-// -------------------------------------------------------
 // NDEF URI prefix table (NFC Forum URI Record spec)
 // -------------------------------------------------------
 const char* uriPrefix(byte code) {
@@ -261,10 +256,9 @@ String parseNDEF(byte* data, byte len) {
     byte  type_len    = data[i + 3];
     byte  payload_len = data[i + 4];
     byte* type        = data + i + 5;
-    byte* payload     = type + type_len;  // payload starts right after type bytes
+    byte* payload     = type + type_len;
 
     if (type_len == 1 && type[0] == 0x54) {  // 'T' = Text record
-      // payload: [status][lang (lang_len bytes)][text]
       byte lang_len = payload[0] & 0x3F;
       byte text_len = payload_len - 1 - lang_len;
       if (text_len > 0 && 1 + lang_len + text_len <= payload_len) {
@@ -273,15 +267,54 @@ String parseNDEF(byte* data, byte len) {
     }
 
     if (type_len == 1 && type[0] == 0x55) {  // 'U' = URI record
-      // payload: [prefix_code][uri_suffix]
       String uri = uriPrefix(payload[0]);
       uri += String((char*)(payload + 1), payload_len - 1);
       return uri;
     }
 
-    break;  // only parse first TLV record
+    break;
   }
   return "";
+}
+
+// -------------------------------------------------------
+// Write pre-built NDEF TLV (writeData) to sector 1 (blocks 4/5/6).
+// NFC Forum-formatted cards (via NFC Tools) protect writes with Key B,
+// so we try Key A first (both NFC Forum and factory), then Key B (factory).
+// -------------------------------------------------------
+void writeCard() {
+  static const byte KEY_B_FACTORY[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  // Try Key A (both NFC Forum and factory defaults via authSector1)
+  bool authed = authSector1();
+
+  if (!authed) {
+    // Try Key B with factory default
+    MFRC522::MIFARE_Key keyB;
+    memcpy(keyB.keyByte, KEY_B_FACTORY, 6);
+    rfid.PCD_StopCrypto1();
+    authed = (rfid.PCD_Authenticate(
+        MFRC522::PICC_CMD_MF_AUTH_KEY_B, DATA_BLOCKS[0], &keyB, &rfid.uid)
+        == MFRC522::STATUS_OK);
+    if (!authed) {
+      Serial.println("Auth failed for write — card may use a non-default Key B");
+      return;
+    }
+  }
+
+  for (byte i = 0; i < 3; i++) {
+    MFRC522::StatusCode s = rfid.MIFARE_Write(DATA_BLOCKS[i], writeData + i * 16, 16);
+    if (s != MFRC522::STATUS_OK) {
+      Serial.print("Write block ");
+      Serial.print(DATA_BLOCKS[i]);
+      Serial.print(" failed: ");
+      Serial.println(rfid.GetStatusCodeName(s));
+      rfid.PCD_StopCrypto1();
+      return;
+    }
+  }
+  rfid.PCD_StopCrypto1();
+  Serial.println("Write OK");
 }
 
 // -------------------------------------------------------
@@ -320,27 +353,6 @@ void readCard() {
   }
 }
 
-void writeCard(const String& text) {
-  if (!authSector1()) return;
-
-  byte data[48];
-  buildNDEF(text, data);
-
-  for (byte i = 0; i < 3; i++) {
-    MFRC522::StatusCode s = rfid.MIFARE_Write(DATA_BLOCKS[i], data + i * 16, 16);
-    if (s != MFRC522::STATUS_OK) {
-      Serial.print("Write block ");
-      Serial.print(DATA_BLOCKS[i]);
-      Serial.print(" failed: ");
-      Serial.println(rfid.GetStatusCodeName(s));
-      rfid.PCD_StopCrypto1();
-      return;
-    }
-  }
-  rfid.PCD_StopCrypto1();
-  Serial.println("Write OK");
-}
-
 // -------------------------------------------------------
 
 void setup() {
@@ -358,23 +370,29 @@ void setup() {
   if (ver == 0x00 || ver == 0xFF) {
     Serial.println("ERROR: RC522 not responding. Check wiring.");
   } else {
-    Serial.println("Ready. Type text + Enter to write, tap to read.");
+    Serial.println("Ready. Tap a card to read NDEF.");
+    Serial.println("To write: type  write Hello World  then tap a Mifare card.");
   }
 }
 
 void loop() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') {
-      pendingWrite.trim();
-      if (pendingWrite.length() > 0) {
-        writeQueued = true;
-        Serial.print("Queued: \"");
-        Serial.print(pendingWrite);
-        Serial.println("\" — tap card now");
+  // Handle Serial write commands: "write <text>"
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("write ")) {
+      String text = line.substring(6);
+      if (text.length() > 38) {
+        Serial.println("Text too long (max 38 chars)");
+      } else if (text.length() > 0) {
+        writeDataLen = buildNDEFText(text, writeData);
+        hasPendingWrite = true;
+        Serial.print("Queued NDEF text \"");
+        Serial.print(text);
+        Serial.println("\" — tap a Mifare card to write.");
       }
-    } else if (c != '\r') {
-      pendingWrite += c;
+    } else if (line.length() > 0) {
+      Serial.println("Unknown command. Use: write <text>  (max 38 chars)");
     }
   }
 
@@ -388,7 +406,7 @@ void loop() {
   // in HCE mode) as PICC_TYPE_MIFARE_1K, causing Mifare auth to be attempted instead
   // of ISO-DEP. Checking the bit directly covers SAK=0x20 and SAK=0x28.
   if (rfid.uid.sak & 0x20) {
-    readT4TCard(); // Android HCE or any Type 4 Tag — read-only
+    readT4TCard();
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
     delay(500);
@@ -406,10 +424,9 @@ void loop() {
     return;
   }
 
-  if (writeQueued) {
-    writeCard(pendingWrite);
-    pendingWrite = "";
-    writeQueued  = false;
+  if (hasPendingWrite) {
+    writeCard();
+    hasPendingWrite = false;
   } else {
     readCard();
   }
