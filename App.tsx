@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import {
   Alert,
   AppState,
+  Image,
   Modal,
   NativeModules,
   ScrollView,
@@ -31,6 +32,35 @@ function openFileAsync(mimeType: string): Promise<string> {
   return new Promise((resolve, reject) => {
     SaveFile.open(mimeType, (err: any, result: string) => {
       if (err) reject(err); else resolve(result);
+    });
+  });
+}
+
+function bytesToBase64(bytes: number[]): string {
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+function base64ToBytes(b64: string): number[] {
+  const binary = atob(b64);
+  const out: number[] = new Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function saveFileBinaryAsync(bytes: number[], filename: string, mimeType: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    SaveFile.saveBinary(bytesToBase64(bytes), filename, mimeType, (err: any) => {
+      if (err) reject(err); else resolve();
+    });
+  });
+}
+
+function openFileBinaryAsync(mimeType: string): Promise<number[]> {
+  return new Promise((resolve, reject) => {
+    SaveFile.openBinary(mimeType, (err: any, result: string) => {
+      if (err) reject(err); else resolve(base64ToBytes(result));
     });
   });
 }
@@ -73,6 +103,23 @@ type TagData = {
   ndefUsedBytes: number;
   rawPages?: { page: number; hex: string }[];
 };
+
+type MifareBlock = {
+  sector: number;
+  block: number;        // absolute block index
+  blockInSector: number;
+  blockCount: number;   // total blocks in this sector
+  data: number[];       // 16 bytes
+  sectorKey: number[];  // Key A used to authenticate the source sector
+};
+
+const MIFARE_KEYS: number[][] = [
+  [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+  [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5],
+  [0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7],
+  [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+  [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+];
 
 // ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -683,15 +730,16 @@ function ReadScreen() {
         await NfcManager.cancelTechnologyRequest();
       } catch { /* NDEF not available, or tag removed before Phase 2 — handled below */ }
 
-      // Phase 2: MifareUltralight tech — dump all raw pages for a complete memory snapshot.
-      // Works for Ultralight/NTAG; quietly skipped for IsoDep (Type 4) tags.
+      // Phase 2: NfcA transceive — dump all raw pages for a complete memory snapshot.
+      // Uses the standard NFC Type 2 READ command (0x30) which works for NTAG/Ultralight.
+      // Quietly skipped for IsoDep (Type 4) tags which don't respond to 0x30.
       try {
-        await NfcManager.requestTechnology(NfcTech.MifareUltralight);
+        await NfcManager.requestTechnology(NfcTech.NfcA);
         if (!raw) raw = (await NfcManager.getTag()) as any;
         const pages: { page: number; hex: string }[] = [];
         for (let pageNum = 0; pageNum < 256; pageNum += 4) {
           try {
-            const resp: number[] = await NfcManager.mifareUltralightHandlerAndroid.readPages(pageNum);
+            const resp: number[] = await NfcManager.nfcAHandler.transceive([0x30, pageNum]);
             for (let i = 0; i < 4 && pageNum + i < 256; i++) {
               const slice = resp.slice(i * 4, (i + 1) * 4);
               pages.push({
@@ -710,7 +758,7 @@ function ReadScreen() {
             parsed.records.forEach(r => records.push(r));
           }
         }
-      } catch { /* IsoDep or MifareUltralight unsupported — fine if Phase 1 gave us NDEF data */ }
+      } catch { /* IsoDep or other non-Type2 tag — fine if Phase 1 gave us NDEF data */ }
 
       if (!raw) throw new Error('No tag detected');
 
@@ -974,16 +1022,16 @@ function WriteScreen() {
       setErrorMsg('');
       try {
         if (onfctFile.raw?.pages && onfctFile.raw.pages.length > 0) {
-          // Write raw pages back via MifareUltralight writePage.
+          // Write raw pages via NfcA transceive using NFC Type 2 WRITE command (0xA2).
           // Pages 0-2: UID, OTP, lock bytes — hardware read-only, skip them.
           // Page 3: CC (Capability Container) — writable; restoring it makes a
           // blank target NDEF-capable with the correct size/permissions.
           // Pages 4+: user data (NDEF TLV).
-          await NfcManager.requestTechnology(NfcTech.MifareUltralight);
+          await NfcManager.requestTechnology(NfcTech.NfcA);
           for (const { page, hex } of onfctFile.raw.pages) {
             if (page < 3) continue;
             const data = hex.trim().split(/\s+/).map(h => parseInt(h, 16));
-            await NfcManager.mifareUltralightHandlerAndroid.writePage(page, data);
+            await NfcManager.nfcAHandler.transceive([0xA2, page, ...data]);
           }
         } else {
           const bytes = onfctFile.ndef.encodedHex
@@ -1479,25 +1527,232 @@ type CloneStatus = 'idle' | 'reading' | 'ready' | 'writing' | 'done' | 'error';
 function CloneFlow({ onBack }: { onBack: () => void }) {
   const [status, setStatus] = useState<CloneStatus>('idle');
   const [errorMsg, setErrorMsg] = useState('');
-  const [sourceBytes, setSourceBytes] = useState<number[]>([]);
-  const [sourceRecordCount, setSourceRecordCount] = useState(0);
+  const [binError, setBinError] = useState('');
+  const [sourcePages, setSourcePages] = useState<{ page: number; hex: string }[]>([]);
+  const [sourceMifareBlocks, setSourceMifareBlocks] = useState<MifareBlock[]>([]);
+  const [sourceBytes, setSourceBytes] = useState<number[]>([]); // NDEF fallback only
+
+  function resetSource() {
+    setSourcePages([]);
+    setSourceMifareBlocks([]);
+    setSourceBytes([]);
+  }
+
+  async function saveBin() {
+    let bytes: number[];
+    if (sourceMifareBlocks.length > 0) {
+      bytes = [...sourceMifareBlocks]
+        .sort((a, b) => a.block - b.block)
+        .flatMap(blk => blk.data);
+    } else if (sourcePages.length > 0) {
+      bytes = [...sourcePages]
+        .sort((a, b) => a.page - b.page)
+        .flatMap(p => p.hex.trim().split(/\s+/).map(h => parseInt(h, 16)));
+    } else {
+      bytes = sourceBytes;
+    }
+    try {
+      await saveFileBinaryAsync(bytes, 'tag_dump.bin', 'application/octet-stream');
+    } catch (e: any) {
+      if (e?.code !== 'CANCELLED') {
+        Alert.alert('Save Failed', e?.message ?? 'Could not save file.');
+      }
+    }
+  }
+
+  async function loadBin() {
+    setBinError('');
+    try {
+      const bytes = await openFileBinaryAsync('*/*');
+      if (bytes.length === 0) throw new Error('File is empty');
+
+      const defaultKey = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+      if (bytes.length === 320 || bytes.length === 1024 || bytes.length === 4096) {
+        // MIFARE Classic memory dump
+        const blocks: MifareBlock[] = [];
+        if (bytes.length === 320) {
+          // MIFARE Mini: 5 sectors × 4 blocks × 16 bytes
+          for (let s = 0; s < 5; s++) {
+            for (let b = 0; b < 4; b++) {
+              const abs = s * 4 + b;
+              blocks.push({ sector: s, block: abs, blockInSector: b, blockCount: 4, data: bytes.slice(abs * 16, abs * 16 + 16), sectorKey: defaultKey });
+            }
+          }
+        } else if (bytes.length === 1024) {
+          // MIFARE Classic 1K: 16 sectors × 4 blocks × 16 bytes
+          for (let s = 0; s < 16; s++) {
+            for (let b = 0; b < 4; b++) {
+              const abs = s * 4 + b;
+              blocks.push({ sector: s, block: abs, blockInSector: b, blockCount: 4, data: bytes.slice(abs * 16, abs * 16 + 16), sectorKey: defaultKey });
+            }
+          }
+        } else {
+          // MIFARE Classic 4K: sectors 0-31 (4 blocks), sectors 32-39 (16 blocks)
+          for (let s = 0; s < 32; s++) {
+            for (let b = 0; b < 4; b++) {
+              const abs = s * 4 + b;
+              blocks.push({ sector: s, block: abs, blockInSector: b, blockCount: 4, data: bytes.slice(abs * 16, abs * 16 + 16), sectorKey: defaultKey });
+            }
+          }
+          for (let s = 32; s < 40; s++) {
+            for (let b = 0; b < 16; b++) {
+              const abs = 128 + (s - 32) * 16 + b;
+              blocks.push({ sector: s, block: abs, blockInSector: b, blockCount: 16, data: bytes.slice(abs * 16, abs * 16 + 16), sectorKey: defaultKey });
+            }
+          }
+        }
+        setSourceMifareBlocks(blocks);
+        setSourcePages([]);
+        setSourceBytes([]);
+      } else if (bytes.length % 4 === 0) {
+        // NFC Type 2 / NTAG: pages of 4 bytes
+        const pages: { page: number; hex: string }[] = [];
+        for (let i = 0; i < bytes.length; i += 4) {
+          pages.push({
+            page: i / 4,
+            hex: bytes.slice(i, i + 4).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
+          });
+        }
+        setSourcePages(pages);
+        setSourceMifareBlocks([]);
+        setSourceBytes([]);
+      } else {
+        // Raw NDEF bytes fallback
+        setSourceBytes(bytes);
+        setSourcePages([]);
+        setSourceMifareBlocks([]);
+      }
+      Vibration.vibrate(100);
+      setStatus('ready');
+    } catch (e: any) {
+      if (e?.code !== 'CANCELLED') {
+        setBinError(e?.message ?? 'Could not load file.');
+      }
+    }
+  }
 
   async function readSource() {
     setStatus('reading');
     setErrorMsg('');
+    console.log('[Clone] readSource start');
     try {
-      await NfcManager.requestTechnology(NfcTech.Ndef);
-      const tag = (await NfcManager.getTag()) as any;
-      if (!tag) throw new Error('No tag detected');
-      const msg = tag.ndefMessage;
-      if (!Array.isArray(msg) || msg.length === 0) throw new Error('Source tag has no NDEF data to clone');
-      const bytes = encodeNdefFallback(msg);
-      setSourceBytes(bytes);
-      setSourceRecordCount(msg.length);
+      // Phase 1: NDEF — fast primary read for any NDEF-formatted tag
+      let ndefBytes: number[] = [];
+      let gotNdef = false;
+      try {
+        console.log('[Clone] phase 1: requesting NDEF...');
+        await NfcManager.requestTechnology(NfcTech.Ndef);
+        const tag = (await NfcManager.getTag()) as any;
+        if (tag && Array.isArray(tag.ndefMessage) && tag.ndefMessage.length > 0) {
+          ndefBytes = encodeNdefFallback(tag.ndefMessage);
+          gotNdef = true;
+          console.log('[Clone] NDEF bytes:', ndefBytes.length);
+        } else {
+          console.log('[Clone] NDEF tech connected but no records');
+        }
+      } catch (ndefErr) {
+        console.log('[Clone] NDEF not available:', ndefErr);
+      } finally {
+        await NfcManager.cancelTechnologyRequest().catch(() => {});
+      }
+
+      // Phase 2: MifareClassic — full sector/block dump
+      let gotMifare = false;
+      try {
+        console.log('[Clone] phase 2: requesting MifareClassic...');
+        await NfcManager.requestTechnology(NfcTech.MifareClassic);
+        const MC = NfcManager.mifareClassicHandlerAndroid;
+        const sectorCount: number = await MC.mifareClassicGetSectorCount();
+        console.log(`[Clone] MifareClassic: ${sectorCount} sectors`);
+        const blocks: MifareBlock[] = [];
+
+        for (let s = 0; s < sectorCount; s++) {
+          // Try common Key A values in order
+          let authKey: number[] | null = null;
+          for (const key of MIFARE_KEYS) {
+            try {
+              await MC.mifareClassicAuthenticateA(s, key);
+              authKey = key;
+              break;
+            } catch { /* try next key */ }
+          }
+          if (!authKey) {
+            console.log(`[Clone] sector ${s}: all keys failed, skipping`);
+            continue;
+          }
+
+          const blockCount: number = await MC.mifareClassicGetBlockCountInSector(s);
+          const firstBlock: number = await MC.mifareClassicSectorToBlock(s);
+          for (let b = 0; b < blockCount; b++) {
+            try {
+              const data: number[] = await MC.mifareClassicReadBlock(firstBlock + b);
+              blocks.push({ sector: s, block: firstBlock + b, blockInSector: b, blockCount, data, sectorKey: authKey });
+            } catch (blkErr) {
+              console.log(`[Clone] block ${firstBlock + b} read failed:`, blkErr);
+            }
+          }
+        }
+
+        console.log(`[Clone] MifareClassic: read ${blocks.length} blocks`);
+        if (blocks.length > 0) {
+          setSourceMifareBlocks(blocks);
+          gotMifare = true;
+        }
+      } catch (mcErr) {
+        console.log('[Clone] MifareClassic phase skipped:', mcErr);
+      } finally {
+        await NfcManager.cancelTechnologyRequest().catch(() => {});
+      }
+
+      // Phase 3: NfcA transceive — raw page dump for NTAG/Type 2
+      let gotPages = false;
+      if (!gotMifare) {
+        try {
+          console.log('[Clone] phase 3: requesting NfcA for raw pages...');
+          await NfcManager.requestTechnology(NfcTech.NfcA);
+          const pages: { page: number; hex: string }[] = [];
+          for (let pageNum = 0; pageNum < 256; pageNum += 4) {
+            try {
+              const resp: number[] = await NfcManager.nfcAHandler.transceive([0x30, pageNum]);
+              for (let i = 0; i < 4 && pageNum + i < 256; i++) {
+                const slice = resp.slice(i * 4, (i + 1) * 4);
+                pages.push({
+                  page: pageNum + i,
+                  hex: slice.map((b: number) => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
+                });
+              }
+            } catch (pageErr) {
+              console.log(`[Clone] page read stopped at page ${pageNum}:`, pageErr);
+              break;
+            }
+          }
+          console.log(`[Clone] read ${pages.length} pages`);
+          if (pages.length > 0) {
+            setSourcePages(pages);
+            gotPages = true;
+          }
+        } catch (nfcAErr) {
+          console.log('[Clone] NfcA phase skipped:', nfcAErr);
+        } finally {
+          await NfcManager.cancelTechnologyRequest().catch(() => {});
+        }
+      }
+
+      console.log(`[Clone] gotMifare=${gotMifare} gotPages=${gotPages} gotNdef=${gotNdef}`);
+      if (!gotMifare && !gotPages && !gotNdef) {
+        throw new Error('No data found on source tag — tag may be blank or unsupported');
+      }
+      if (!gotMifare && !gotPages) {
+        setSourceBytes(ndefBytes);
+      }
+
+      console.log('[Clone] setting status ready');
       Vibration.vibrate(100);
       setStatus('ready');
     } catch (e: any) {
       const msg: string = e?.message ?? String(e);
+      console.log('[Clone] readSource error:', msg);
       if (msg === 'cancelled') { setStatus('idle'); }
       else { setErrorMsg(msg); setStatus('error'); }
     } finally {
@@ -1509,24 +1764,106 @@ function CloneFlow({ onBack }: { onBack: () => void }) {
     setStatus('writing');
     setErrorMsg('');
     try {
-      let usedNdef = true;
-      try {
-        await NfcManager.requestTechnology(NfcTech.Ndef);
-      } catch {
-        usedNdef = false;
-        await NfcManager.requestTechnology(NfcTech.NdefFormatable);
-      }
+      if (sourceMifareBlocks.length > 0) {
+        // MIFARE Classic write: authenticate each sector then write blocks.
+        // Block 0 (sector 0, block 0) is the manufacturer block — hardware-locked on real cards, skip it.
+        // Sector trailers: write with Key A restored from the source auth key (Key A is masked as
+        // 00 00 00 00 00 00 on read, so we substitute the key we actually used to authenticate).
+        console.log('[Clone] writeTarget: requesting MifareClassic...');
+        await NfcManager.requestTechnology(NfcTech.MifareClassic);
+        console.log('[Clone] writeTarget: MifareClassic granted');
+        const MC = NfcManager.mifareClassicHandlerAndroid;
 
-      if (usedNdef) {
-        const tag = (await NfcManager.getTag()) as any;
-        if (tag?.maxSize != null && tag.maxSize < sourceBytes.length) {
-          throw new Error(`Target tag is too small: ${tag.maxSize} bytes available, source needs ${sourceBytes.length}.`);
+        // Extract Key B from source sector trailers (bytes 10–15 of each trailer block).
+        // On NDEF cards the access bits make Key B readable via Key A, so these bytes hold
+        // the real key — not zeros. Build a per-sector map before the write loop.
+        const sectorKeyB = new Map<number, number[]>();
+        for (const blk of sourceMifareBlocks) {
+          if (blk.blockInSector === blk.blockCount - 1) {
+            const kb = blk.data.slice(10, 16);
+            if (kb.some(b => b !== 0)) {
+              sectorKeyB.set(blk.sector, kb);
+              console.log(`[Clone] sector ${blk.sector} Key B from trailer: ${kb.map(b => b.toString(16).padStart(2,'0')).join(':')}`);
+            }
+          }
         }
-        await NfcManager.ndefHandler.writeNdefMessage(sourceBytes);
-      } else {
-        await NfcManager.ndefFormatableHandlerAndroid.formatNdef(sourceBytes);
-      }
 
+        let lastAuthSector = -1;
+        let writtenBlocks = 0;
+        let skippedBlocks = 0;
+        for (const { sector, block, blockInSector, blockCount, data, sectorKey } of sourceMifareBlocks) {
+          if (block === 0) { console.log('[Clone] block 0 skipped (manufacturer)'); continue; }
+          if (sector !== lastAuthSector) {
+            // Priority: source Key B (from trailer) → source Key A → common keys (B then A)
+            const sourceKeyB = sectorKeyB.get(sector);
+            const keysToTry: Array<[string, number[]]> = [];
+            if (sourceKeyB) keysToTry.push(['B', sourceKeyB]);
+            keysToTry.push(['A', sectorKey]);
+            for (const k of MIFARE_KEYS) {
+              if (k.join() !== sectorKey.join() && (!sourceKeyB || k.join() !== sourceKeyB.join())) {
+                keysToTry.push(['B', k], ['A', k]);
+              }
+            }
+
+            let authedDesc: string | null = null;
+            for (const [label, key] of keysToTry) {
+              const authFn = label === 'B' ? MC.mifareClassicAuthenticateB.bind(MC) : MC.mifareClassicAuthenticateA.bind(MC);
+              try {
+                await authFn(sector, key);
+                authedDesc = `Key${label} ${key.map(b => b.toString(16).padStart(2,'0')).join(':')}`;
+                break;
+              } catch { /* try next */ }
+            }
+            if (!authedDesc) throw new Error(`Could not authenticate target sector ${sector} — target tag may use unknown keys`);
+            console.log(`[Clone] sector ${sector} write auth OK with ${authedDesc}`);
+            lastAuthSector = sector;
+          }
+          const isTrailer = blockInSector === blockCount - 1;
+          let writeData = [...data];
+          if (isTrailer) {
+            for (let i = 0; i < 6; i++) writeData[i] = sectorKey[i];
+          }
+          const hexData = writeData.map(b => b.toString(16).padStart(2,'0')).join(' ');
+          console.log(`[Clone] writing block ${block} (sector ${sector}, blockInSector ${blockInSector}, trailer=${isTrailer}): ${hexData}`);
+          try {
+            await MC.mifareClassicWriteBlock(block, writeData);
+            console.log(`[Clone] block ${block} written OK`);
+            writtenBlocks++;
+          } catch (writeErr) {
+            console.log(`[Clone] block ${block} write FAILED (access denied or tag moved — use a blank target card):`, writeErr);
+            skippedBlocks++;
+          }
+        }
+        console.log(`[Clone] MIFARE write done: ${writtenBlocks} written, ${skippedBlocks} skipped`);
+        if (writtenBlocks === 0) {
+          throw new Error('No blocks could be written — use a blank MIFARE Classic card as the target (factory default keys)');
+        }
+      } else if (sourcePages.length > 0) {
+        await NfcManager.requestTechnology(NfcTech.NfcA);
+        for (const { page, hex } of sourcePages) {
+          if (page < 3) continue;
+          const data = hex.trim().split(/\s+/).map(h => parseInt(h, 16));
+          // NFC Type 2 WRITE command: cmd 0xA2, page offset, 4 data bytes
+          await NfcManager.nfcAHandler.transceive([0xA2, page, ...data]);
+        }
+      } else {
+        let usedNdef = true;
+        try {
+          await NfcManager.requestTechnology(NfcTech.Ndef);
+        } catch {
+          usedNdef = false;
+          await NfcManager.requestTechnology(NfcTech.NdefFormatable);
+        }
+        if (usedNdef) {
+          const tag = (await NfcManager.getTag()) as any;
+          if (tag?.maxSize != null && tag.maxSize < sourceBytes.length) {
+            throw new Error(`Target tag is too small: ${tag.maxSize} bytes available, source needs ${sourceBytes.length}.`);
+          }
+          await NfcManager.ndefHandler.writeNdefMessage(sourceBytes);
+        } else {
+          await NfcManager.ndefFormatableHandlerAndroid.formatNdef(sourceBytes);
+        }
+      }
       Vibration.vibrate(200);
       setStatus('done');
     } catch (e: any) {
@@ -1571,19 +1908,42 @@ function CloneFlow({ onBack }: { onBack: () => void }) {
         </View>
         <Text style={styles.screenTitle}>Source Read</Text>
         <View style={[styles.card, { alignSelf: 'stretch', marginBottom: 4 }]}>
-          <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>NDEF records</Text>
-            <Text style={styles.infoValue}>{sourceRecordCount}</Text>
-          </View>
-          <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
-            <Text style={styles.infoLabel}>Bytes in RAM</Text>
-            <Text style={styles.infoValue}>{sourceBytes.length}</Text>
-          </View>
+          {sourceMifareBlocks.length > 0 ? (
+            <>
+              <View style={styles.infoRow}>
+                <Text style={styles.infoLabel}>Sectors read</Text>
+                <Text style={styles.infoValue}>{new Set(sourceMifareBlocks.map(b => b.sector)).size}</Text>
+              </View>
+              <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.infoLabel}>Blocks read</Text>
+                <Text style={styles.infoValue}>{sourceMifareBlocks.length}</Text>
+              </View>
+            </>
+          ) : sourcePages.length > 0 ? (
+            <>
+              <View style={styles.infoRow}>
+                <Text style={styles.infoLabel}>Memory pages</Text>
+                <Text style={styles.infoValue}>{sourcePages.length}</Text>
+              </View>
+              <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.infoLabel}>Bytes in RAM</Text>
+                <Text style={styles.infoValue}>{sourcePages.length * 4}</Text>
+              </View>
+            </>
+          ) : (
+            <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
+              <Text style={styles.infoLabel}>Bytes in RAM</Text>
+              <Text style={styles.infoValue}>{sourceBytes.length}</Text>
+            </View>
+          )}
         </View>
         <TouchableOpacity style={[styles.actionButton, styles.actionButtonWrite, { alignSelf: 'stretch' }]} onPress={writeTarget} activeOpacity={0.7}>
           <Text style={styles.actionButtonText}>Write to Target Tag</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={[styles.actionButton, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, alignSelf: 'stretch' }]} onPress={() => { setSourceBytes([]); setStatus('idle'); }} activeOpacity={0.7}>
+        <TouchableOpacity style={[styles.actionButton, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, alignSelf: 'stretch' }]} onPress={saveBin} activeOpacity={0.7}>
+          <Text style={[styles.actionButtonText, { color: C.text }]}>Save as .bin</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.actionButton, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, alignSelf: 'stretch' }]} onPress={() => { resetSource(); setStatus('idle'); }} activeOpacity={0.7}>
           <Text style={[styles.actionButtonText, { color: C.text }]}>Re-scan Source</Text>
         </TouchableOpacity>
         <BackButton onPress={onBack} />
@@ -1613,8 +1973,8 @@ function CloneFlow({ onBack }: { onBack: () => void }) {
           <Text style={styles.iconText}>✓</Text>
         </View>
         <Text style={styles.screenTitle}>Clone Complete</Text>
-        <Text style={styles.screenSubtitle}>NDEF data written to target tag.</Text>
-        <TouchableOpacity style={[styles.actionButton, styles.actionButtonOther]} onPress={() => { setSourceBytes([]); setStatus('idle'); }}>
+        <Text style={styles.screenSubtitle}>Tag memory written to target tag.</Text>
+        <TouchableOpacity style={[styles.actionButton, styles.actionButtonOther]} onPress={() => { resetSource(); setStatus('idle'); }}>
           <Text style={styles.actionButtonText}>Clone Another</Text>
         </TouchableOpacity>
         <BackButton onPress={onBack} />
@@ -1633,12 +1993,18 @@ function CloneFlow({ onBack }: { onBack: () => void }) {
         <Text style={[styles.screenSubtitle, styles.errorText]}>{errorMsg}</Text>
       ) : (
         <Text style={styles.screenSubtitle}>
-          Reads the NDEF data from a source tag into memory, then writes the exact same bytes to a target tag.
+          Reads all memory pages from a source tag and writes them to a target tag — works with any data format.
         </Text>
       )}
       <TouchableOpacity style={[styles.actionButton, styles.actionButtonOther]} onPress={readSource}>
         <Text style={styles.actionButtonText}>{status === 'error' ? 'Try Again' : 'Start — Scan Source Tag'}</Text>
       </TouchableOpacity>
+      <TouchableOpacity style={[styles.actionButton, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, alignSelf: 'stretch' }]} onPress={loadBin} activeOpacity={0.7}>
+        <Text style={[styles.actionButtonText, { color: C.text }]}>Load from .bin</Text>
+      </TouchableOpacity>
+      {binError ? (
+        <Text style={[styles.screenSubtitle, styles.errorText]}>{binError}</Text>
+      ) : null}
       <BackButton onPress={onBack} />
     </View>
   );
@@ -1717,8 +2083,16 @@ function AppContent() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>OpenNFCT</Text>
-        <Text style={styles.headerSubtitle}>Open NFC Toolkit</Text>
+        <View style={styles.headerRow}>
+          <Image
+            source={require('./android/app/src/main/res/1024.png')}
+            style={styles.headerLogo}
+          />
+          <View>
+            <Text style={styles.headerTitle}>OpenNFCT</Text>
+            <Text style={styles.headerSubtitle}>Open NFC Toolkit</Text>
+          </View>
+        </View>
       </View>
       <TabBar activeTab={activeTab} onTabChange={setActiveTab} />
       <View style={styles.content}>
@@ -1774,9 +2148,11 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
 
   header: {
-    paddingHorizontal: 24, paddingTop: 20, paddingBottom: 16,
+    paddingHorizontal: 24, paddingTop: 16, paddingBottom: 14,
     borderBottomWidth: 1, borderBottomColor: C.border,
   },
+  headerRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  headerLogo: { width: 44, height: 44, borderRadius: 10 },
   headerTitle: { fontSize: 22, fontWeight: '700', color: C.accent, letterSpacing: 1.2 },
   headerSubtitle: { fontSize: 12, color: C.textMuted, marginTop: 2, letterSpacing: 0.5 },
 
