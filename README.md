@@ -1,97 +1,86 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+<div align="center">
+  <img src="logos/opennfct_logo.svg" alt="OpenNFCT" width="512" />
+  <h1>OpenNFCT</h1>
+  <p><strong>Open NFC Toolkit — read, write, clone, and emulate NFC tags on Android</strong></p>
 
-# Getting Started
+  ![Platform](https://img.shields.io/badge/platform-Android-3ddc84?logo=android&logoColor=white)
+  ![React Native](https://img.shields.io/badge/React_Native-0.85-61dafb?logo=react&logoColor=white)
+  ![License](https://img.shields.io/badge/license-MIT-blue)
+</div>
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+---
 
-## Step 1: Start Metro
+OpenNFCT is a free, open-source Android app for working with NFC tags. It covers the full tag lifecycle — scan a tag to inspect its contents, write new records, clone it to another tag, erase it, or emulate it from your phone. MIFARE Classic, NTAG, and ISO-DEP tags are all supported.
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Features
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+- **Read** — Scan any NFC tag and see its UID, tag type, ATQA/SAK, tech stack, and all NDEF records decoded into human-readable form.
+- **Write** — Write plain text, URLs, email addresses, or phone numbers to a tag. Load a `.onfct` file to restore a full tag dump. Unformatted tags are automatically formatted before writing.
+- **Memory Manager** — Browse raw tag memory as hex, UTF-8, ASCII, or binary. Inspect NDEF record structure and type. Export or copy in any format, or save as a `.onfct` file.
+- **Erase** — Overwrite all NDEF records on a tag with an empty message.
+- **Format** — Initialise an unformatted tag so it can store NDEF data.
+- **Clone** — Copy the full memory of one tag to another. Supports MIFARE Classic sector-by-sector auth and write, NTAG/Type 2 raw page cloning, and NDEF fallback. Import/export raw dumps as `.bin` files.
+- **Emulate** — Use Android HCE to emulate a tag from a `.onfct` file, making your phone act as an NFC Type 4 tag.
 
-```sh
-# Using npm
-npm start
+## Supported Tags
 
-# OR using Yarn
-yarn start
+| Family | Examples |
+|---|---|
+| NFC Type 2 / NTAG | NTAG213, NTAG215, NTAG216, Mifare Ultralight |
+| MIFARE Classic | Classic 1K, Classic 4K, Mini |
+| ISO-DEP / Type 4 | Most modern contactless cards and stickers |
+| NFC-A / NFC-B | Generic low-level access |
+
+> **HCE emulation note:** Android can only emulate ISO-DEP (Type 4) cards. Emulating a MIFARE Classic tag will work with readers that support ISO-DEP, but will be rejected by readers that exclusively accept MIFARE Classic (most access-control systems).
+
+## Installation
+
+No Play Store required — just sideload the APK.
+
+1. Download `OpenNFCT.apk` from the [latest release](../../releases/latest).
+2. On your Android device, go to **Settings → Apps → Install unknown apps** and allow installs from your browser or file manager.
+3. Open the downloaded APK and tap **Install**.
+
+## Building from Source
+
+**Requirements:** Node.js 18+, JDK 17+, Android SDK.
+
+```bash
+git clone https://github.com/Miky8745/OpenNFCT.git
+cd OpenNFCT
+npm install
 ```
 
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
+**Debug build (connected device or emulator):**
+```bash
 npm run android
-
-# OR using Yarn
-yarn android
 ```
 
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
+**Release APK:**
+```bash
+cd android
+./gradlew assembleRelease
+# Output: android/app/build/outputs/apk/release/app-release.apk
 ```
 
-Then, and every time you update your native dependencies, run:
+> A keystore is required to sign a release build. See the [Android signing guide](https://developer.android.com/studio/publish/app-signing) if you haven't set one up.
 
-```sh
-bundle exec pod install
-```
+## File Formats
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+### `.onfct`
+A JSON snapshot of a scanned tag — includes tag metadata, all decoded NDEF records, and the raw page dump where available. Use it to back up a tag, restore it to a new tag via Write, or emulate it via HCE. Exported from the Memory Manager.
 
-```sh
-# Using npm
-npm run ios
+### `.bin`
+A raw binary memory dump, compatible with other NFC tools. OpenNFCT auto-detects the tag type from the file size on import:
 
-# OR using Yarn
-yarn ios
-```
+| File size | Interpreted as |
+|---|---|
+| 320 bytes | MIFARE Classic Mini |
+| 1024 bytes | MIFARE Classic 1K |
+| 4096 bytes | MIFARE Classic 4K |
+| Multiple of 4 | NFC Type 2 / NTAG pages |
+| Other | Raw NDEF bytes |
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+## License
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+MIT
