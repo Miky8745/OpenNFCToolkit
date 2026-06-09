@@ -83,4 +83,4 @@ A raw binary memory dump, compatible with other NFC tools. OpenNFCT auto-detects
 
 ## License
 
-MIT
+[MIT](LICENSE)
